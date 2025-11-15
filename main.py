@@ -5,18 +5,16 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-
 from config import (
     INTERVALO_BAIXAR, OUTPUT_NAME, FINAL_DIR,
-    WORK_START_HOUR, WORK_END_HOUR
+    WORK_START_HOUR, WORK_END_HOUR, RUN_AT_HOUR, RUN_AT_MINUTE
 )
 from services.driver_factory import create_driver
-from services.auth import login, logout
-# from services.reports_processos import gerar_relatorio
+from services.auth import login, logout, is_logged_in
 from services.reports_iniciais import gerar_relatorio
 from services.baixar_relatorio import baixar_relatorio
 from services.utils import dentro_horario, proximo_dia_util_at, perguntar_com_timeout
-
+from services.checkpoint import checkpoint_clear, checkpoint_load, checkpoint_save
 
 # =================== LOGGING ===================
 LOG_PATH = Path("logs/robo-elaw.log")
@@ -37,20 +35,60 @@ logger.addHandler(ch)
 
 
 def run_once():
-    """Executa o ciclo completo: login → gerar → baixar → logout → fechar navegador."""
+    estado = checkpoint_load()   # pode ser None
     profile_path = Path(tempfile.mkdtemp())
     driver = create_driver()
+
+    # ======================================
+    # 0) LOGIN SEMPRE É GARANTIDO AO INICIAR
+    # ======================================
     try:
-        logger.info("🚀 Login...")
+        if not is_logged_in(driver):
+            logger.info("🔐 Sessão inexistente. Realizando login...")
+            login(driver)
+        else:
+            logger.info("🔒 Sessão já estava ativa.")
+    except:
+        logger.info("🔐 Realizando login inicial...")
         login(driver)
 
-        logger.info("🧾 Gerando relatório de processos...")
-        relatorio_id = gerar_relatorio(driver)
-        # relatorio_id = "3611642"
-        logger.info(f"🆔 ID: {relatorio_id}")
+    try:
+        # ===============================
+        # 1) GERAR RELATÓRIO
+        # ===============================
 
-        logger.info("⬇️ Baixando relatório...")
-        baixar_relatorio(driver, relatorio_id, FINAL_DIR, OUTPUT_NAME, INTERVALO_BAIXAR)
+        # CASO 1 -> retomando
+        if estado and estado.get("stage") == "gerou_relatorio":
+            relatorio_id = estado["relatorio_id"]  # aqui é seguro
+            logger.info(f"🔁 Retomando com relatório ID salvo: {relatorio_id}")
+
+        # CASO 2 -> começando do zero
+        else:
+            logger.info("🧾 Gerando relatório de processos...")
+            relatorio_id = gerar_relatorio(driver)
+            logger.info(f"🆔 ID: {relatorio_id}")
+            checkpoint_save("gerou_relatorio", relatorio_id)
+
+        # ===============================
+        # 2) BAIXAR RELATÓRIO
+        # ===============================
+
+        # CASE 1 — Primeira execução do dia (estado == None)
+        if estado is None:
+            logger.info("⬇️ Baixando relatório (primeira execução)...")
+            baixar_relatorio(driver, relatorio_id, FINAL_DIR, OUTPUT_NAME, INTERVALO_BAIXAR)
+            checkpoint_save("baixou_relatorio", relatorio_id)
+
+        # CASE 2 — Retomando após gerar relatório (não chegou a baixar)
+        elif estado.get("stage") == "gerou_relatorio":
+            logger.info("⬇️ Retomando download pendente do relatório...")
+            baixar_relatorio(driver, relatorio_id, FINAL_DIR, OUTPUT_NAME, INTERVALO_BAIXAR)
+            checkpoint_save("baixou_relatorio", relatorio_id)
+
+        # CASE 3 — Download já estava completo
+        elif estado.get("stage") == "baixou_relatorio":
+            logger.info("📦 Download já havia sido concluído anteriormente. Ignorando etapa.")
+
 
         logger.info("✅ Execução OK.")
 
@@ -59,52 +97,59 @@ def run_once():
         raise
 
     finally:
-        # 🔹 Sempre tentar logout, mesmo em caso de erro
         try:
             logout(driver)
-            logger.info("↩️ Logout executado com sucesso.")
-        except Exception as e:
-            logger.warning(f"⚠️ Falha ao realizar logout: {e}")
+        except:
+            pass
 
-        # 🔹 Fecha completamente o navegador
-        try:
-            driver.quit()
-            logger.info("🧹 Navegador encerrado.")
-        except Exception as e:
-            logger.warning(f"⚠️ Falha ao encerrar navegador: {e}")
-
-        # 🔹 Limpa perfil temporário do Chrome
-        shutil.rmtree(profile_path, ignore_errors=True)
+        driver.quit()
+        checkpoint_clear()
 
 def main():
-    """Loop principal: executa uma vez por dia útil, dentro do horário configurado."""
+    
     ultima_execucao = None
 
     try:
         while True:
             now = datetime.now()
+            executar_fora_do_horario = False  # <-- novo
 
-            # Evita rodar duas vezes no mesmo dia
+            # Já executou hoje
             if ultima_execucao and ultima_execucao.date() == now.date():
                 logger.info("✅ Já executado hoje. Aguardando próximo dia útil 08:00...")
                 prox = proximo_dia_util_at(WORK_START_HOUR)
                 time.sleep(max(10, (prox - now).total_seconds()))
                 continue
 
-            # Checa horário permitido
+            # Fora do horário permitido
             if not dentro_horario(WORK_START_HOUR, WORK_END_HOUR):
                 resposta = perguntar_com_timeout(
                     "⏸ Fora do horário de execução (Seg-Sex, 08h às 18h).\n👉 Deseja executar mesmo assim? (Y/N): ",
                     timeout=15,
                 )
-                if resposta != "y":
+
+                if resposta == "y":
+                    logger.warning("⚠️ Executando fora do horário por confirmação manual do usuário.")
+                    executar_fora_do_horario = True
+                else:
                     logger.info("⏳ Fora do horário, aguardando 30 minutos para checar novamente...")
                     time.sleep(30 * 60)
                     continue
-                else:
-                    logger.warning("⚠️ Executando fora do horário por confirmação manual do usuário.")
 
-            # Executa rotina principal
+            # =============================
+            # Checa horário programado apenas se NÃO for execução forçada
+            # =============================
+            if not executar_fora_do_horario:
+                if not (now.hour == RUN_AT_HOUR and now.minute >= RUN_AT_MINUTE):
+                    logger.info(
+                        f"⏳ Aguardando horário programado: "
+                        f"{RUN_AT_HOUR:02d}:{RUN_AT_MINUTE:02d} "
+                        f"(agora {now.hour:02d}:{now.minute:02d})"
+                    )
+                    time.sleep(60)
+                    continue
+
+            # Execução principal
             try:
                 run_once()
                 ultima_execucao = datetime.now()
@@ -115,9 +160,6 @@ def main():
 
     except KeyboardInterrupt:
         logger.info("🧩 Execução interrompida manualmente pelo usuário. 🛑 Encerrando com segurança...")
-        # Evita que apareça o traceback feio
-        return
 
-   
 if __name__ == "__main__":
     main()
